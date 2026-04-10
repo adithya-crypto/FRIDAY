@@ -6,7 +6,9 @@ import httpx
 import xml.etree.ElementTree as ET
 import asyncio  # Required for parallel execution
 import re
-from datetime import datetime
+from html import unescape
+
+DUCKDUCKGO_HTML_SEARCH = "https://html.duckduckgo.com/html/"
 
 SEED_FEEDS = [
     'https://feeds.bbci.co.uk/news/world/rss.xml',
@@ -48,6 +50,32 @@ async def fetch_and_parse_feed(client, url):
         # If one feed fails, return an empty list so others can still succeed
         return []
 
+
+def _strip_html(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _parse_search_results(html: str) -> list[dict]:
+    pattern = re.compile(
+        r'<a[^>]+class="result__a"[^>]+href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>.*?'
+        r'<a[^>]+class="result__snippet"[^>]*>(?P<snippet>.*?)</a>',
+        re.DOTALL,
+    )
+
+    results = []
+    for match in pattern.finditer(html):
+        href = unescape(match.group("href"))
+        title = _strip_html(match.group("title"))
+        snippet = _strip_html(match.group("snippet"))
+        if not title or not href:
+            continue
+        results.append({"title": title, "link": href, "snippet": snippet})
+        if len(results) >= 5:
+            break
+    return results
+
 def register(mcp):
 
     @mcp.tool()
@@ -83,8 +111,29 @@ def register(mcp):
 
     @mcp.tool()
     async def search_web(query: str) -> str:
-        """Search the web for a given query and return a summary of results."""
-        return f"[stub] Search results for: {query}"
+        """
+        Search the web for a given query and return a compact summary of results.
+        Use this for current events, fresh facts, or when the user asks to look something up.
+        """
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
+            response = await client.post(
+                DUCKDUCKGO_HTML_SEARCH,
+                data={"q": query},
+                headers={"User-Agent": "Friday-AI/1.0"},
+            )
+            response.raise_for_status()
+
+        results = _parse_search_results(response.text)
+        if not results:
+            return f"No reliable live search results came back for: {query}"
+
+        lines = [f"Live search results for: {query}\n"]
+        for idx, result in enumerate(results, start=1):
+            lines.append(f"{idx}. {result['title']}")
+            if result["snippet"]:
+                lines.append(f"   {result['snippet']}")
+            lines.append(f"   Link: {result['link']}")
+        return "\n".join(lines)
 
     @mcp.tool()
     async def fetch_url(url: str) -> str:
